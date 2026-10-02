@@ -104,19 +104,17 @@ static int8_t allocated_from_steamclient_dll( void *ptr )
 
 static void *get_mem_from_steamclient_dll(size_t size, unsigned int version, void *vtbl)
 {
-    static BYTE * const error_ptr = (BYTE *)~(ULONG_PTR)0;
-    static const unsigned int magic = 0x53ba947a;
-    static struct
-    {
-        unsigned int version;
-        void *vtbl;
-        size_t size;
-        void *ptr;
-    }
-    allocated[256];
-    static unsigned int allocated_count;
-    static BYTE *alloc_base;
-    unsigned int i;
+    /* When lsteamclient is loaded as steamclient.dll (standalone NotProton),
+     * carving memory from .data overwrites its own critical global variables
+     * (e.g. steamclient_cs, steamclient_interfaces list), causing crashes in
+     * create_win_interface. Returning NULL safely falls back to direct vtables
+     * and HeapAlloc, matching 64-bit Proton behavior. */
+    return NULL;
+}
+
+#if 0
+static void *unused_get_mem_from_steamclient_dll(size_t size, unsigned int version, void *vtbl)
+{
 
     if (alloc_base == error_ptr)
     {
@@ -211,6 +209,7 @@ static void *get_mem_from_steamclient_dll(size_t size, unsigned int version, voi
 
     return allocated[allocated_count++].ptr;
 }
+#endif
 
 void *alloc_mem_for_iface(size_t size, const char *iface_version)
 {

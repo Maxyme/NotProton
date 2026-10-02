@@ -33,18 +33,49 @@ esac
 
 CX_ROOT="$HOME/Library/Application Support/notproton/runners/current"
 export CX_ROOT
+
+if [ -d "$CX_ROOT/Contents/Resources/wine" ]; then
+  CX_ROOT="$CX_ROOT/Contents/Resources/wine"
+  export CX_ROOT
+fi
+
 # cxcompatdb resolves its database through CX_HOME and logs an error for
 # every module loaded without it :(
 export CX_HOME="$HOME/Library/Application Support/CrossOver"
+
+# Apple Game Porting Toolkit (GPTK) 4 default environment flags
+export D3DM_MTL4="${D3DM_MTL4:-1}"
+export D3DM_ENABLE_METALFX="${D3DM_ENABLE_METALFX:-1}"
+export D3DM_SUPPORT_DXR="${D3DM_SUPPORT_DXR:-1}"
+export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
+export WINEMSYNC="${WINEMSYNC:-1}"
+export WINEESYNC="${WINEESYNC:-1}"
+
 wine_unix="$CX_ROOT/lib/wine/aarch64-unix"
-WINELOADER="$wine_unix/wine.app/Contents/MacOS/wine"
-WINESERVER="$CX_ROOT/CrossOver-Hosted Application/wineserver-arm64"
-if [ ! -x "$WINELOADER" ] || [ ! -x "$WINESERVER" ]; then
-  wine_unix="$CX_ROOT/lib/wine/x86_64-unix"
-  WINELOADER="$wine_unix/wine"
+[ -d "$wine_unix" ] || wine_unix="$CX_ROOT/lib/wine/x86_64-unix"
+
+# Detect WINESERVER
+if [ -x "$CX_ROOT/bin/wineserver" ]; then
+  WINESERVER="$CX_ROOT/bin/wineserver"
+elif [ -x "$CX_ROOT/CrossOver-Hosted Application/wineserver-arm64" ]; then
+  WINESERVER="$CX_ROOT/CrossOver-Hosted Application/wineserver-arm64"
+elif [ -x "$CX_ROOT/CrossOver-Hosted Application/wineserver" ]; then
   WINESERVER="$CX_ROOT/CrossOver-Hosted Application/wineserver"
-  [ -x "$WINESERVER" ] || WINESERVER="$CX_ROOT/CrossOver-Hosted Application/wineserver-x86"
+elif [ -x "$CX_ROOT/CrossOver-Hosted Application/wineserver-x86" ]; then
+  WINESERVER="$CX_ROOT/CrossOver-Hosted Application/wineserver-x86"
 fi
+
+# Detect WINELOADER
+if [ -x "$CX_ROOT/bin/wine64" ]; then
+  WINELOADER="$CX_ROOT/bin/wine64"
+elif [ -x "$CX_ROOT/bin/wine" ]; then
+  WINELOADER="$CX_ROOT/bin/wine"
+elif [ -x "$wine_unix/wine.app/Contents/MacOS/wine" ]; then
+  WINELOADER="$wine_unix/wine.app/Contents/MacOS/wine"
+elif [ -x "$wine_unix/wine" ]; then
+  WINELOADER="$wine_unix/wine"
+fi
+
 export WINELOADER WINESERVER
 export WINEDLLPATH="$CX_ROOT/lib/wine/x86_64-windows:$wine_unix"
 export PATH="$CX_ROOT/bin:$PATH"
@@ -94,6 +125,9 @@ echo "app_id=$app_id (STEAM_COMPAT_APP_ID=$STEAM_COMPAT_APP_ID)" >> "$log" 2>&1 
 
 [ -n "$SteamAppId" ] || export SteamAppId="$app_id"
 [ -n "$SteamGameId" ] || export SteamGameId="$app_id"
+if [ -n "$app_id" ] && [ "$app_id" != 0 ] && [ -d "$STEAM_COMPAT_INSTALL_PATH" ]; then
+  printf '%s\n' "$app_id" > "$STEAM_COMPAT_INSTALL_PATH/steam_appid.txt" 2>/dev/null || true
+fi
 
 prefix_machine() {
   dll="$WINEPREFIX/drive_c/windows/system32/ntdll.dll"
@@ -286,8 +320,21 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   fi
   [ -n "$WINEMSYNC" ] || msync_from=default
   export WINEMSYNC="${WINEMSYNC:-0}"
+  # 32-bit WoW64 processes on Apple Silicon deadlock with WINEMSYNC=1.
+  if [ -f "$1" ] && file -b "$1" 2>/dev/null | grep -q "PE32 "; then
+    if [ "$WINEMSYNC" = "1" ]; then
+      echo "=== 32-bit binary ($1) detected: forcing WINEMSYNC=0 to prevent WoW64 deadlock ===" >> "$log" 2>&1 || true
+      WINEMSYNC=0
+      export WINEMSYNC=0
+    fi
+  fi
   printf '%s' "$WINEMSYNC" \
     > "$STEAM_COMPAT_DATA_PATH/notproton-msync" 2>/dev/null || true
+  if [ -z "$MTL_HUD_ENABLED" ] && [ -r "$STEAM_COMPAT_DATA_PATH/notproton-hud" ]; then
+    MTL_HUD_ENABLED=$(tr -d ' \t\n' < "$STEAM_COMPAT_DATA_PATH/notproton-hud" 2>/dev/null || true)
+    export MTL_HUD_ENABLED
+    echo "hud: MTL_HUD_ENABLED=$MTL_HUD_ENABLED from carry-over" >> "$log" 2>&1 || true
+  fi
   stage_step="prefix arch check"
   refuse_foreign_prefix
   echo "sync: WINEMSYNC=$WINEMSYNC from $msync_from" >> "$log" 2>&1 || true
@@ -305,6 +352,8 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   else
     "$WINELOADER" reg delete 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /f >> "$log" 2>&1 || true
   fi
+  "$WINELOADER" reg add 'HKCU\Software\Wine\Mac Driver' /v OpenGLSurfaceMode /t REG_SZ /d behind /f >> "$log" 2>&1 || true
+
 
   "$WINELOADER" reg add 'HKLM\Software\Classes\steam' /v 'URL Protocol' /t REG_SZ /d '' /f >> "$log" 2>&1 || true
   "$WINELOADER" reg add 'HKLM\Software\Classes\steam\shell\open\command' /ve /t REG_SZ /d '"C:\Program Files (x86)\Steam\steam.exe" "%1"' /f >> "$log" 2>&1 || true
@@ -339,12 +388,21 @@ verify_runner() {
 install_lsteamclient_trigger() {
   src="$bridge_src/i386-windows/lsteamclient.dll"
   dst="$WINEPREFIX/drive_c/windows/syswow64/lsteamclient.dll"
-  [ -f "$src" ] && [ -d "$WINEPREFIX/drive_c/windows/syswow64" ] || return 0
-  cmp -s "$src" "$dst" && return 0
-  if cp -f "$src" "$dst"; then
-    echo "=== installed syswow64 lsteamclient trigger ===" >> "$log" 2>&1 || true
-  else
-    echo "=== could not install the syswow64 lsteamclient trigger ===" >> "$log" 2>&1 || true
+  if [ -f "$src" ] && [ -d "$WINEPREFIX/drive_c/windows/syswow64" ]; then
+    if ! cmp -s "$src" "$dst"; then
+      cp -f "$src" "$dst" && echo "=== installed syswow64 lsteamclient trigger ===" >> "$log" 2>&1 || true
+    fi
+  fi
+  src64="$bridge_src/x86_64-windows/lsteamclient.dll"
+  dst64="$WINEPREFIX/drive_c/windows/system32/lsteamclient.dll"
+  dst64_sc="$WINEPREFIX/drive_c/windows/system32/steamclient64.dll"
+  if [ -f "$src64" ] && [ -d "$WINEPREFIX/drive_c/windows/system32" ]; then
+    if ! cmp -s "$src64" "$dst64"; then
+      cp -f "$src64" "$dst64" && echo "=== installed system32 lsteamclient trigger ===" >> "$log" 2>&1 || true
+    fi
+    if ! cmp -s "$src64" "$dst64_sc"; then
+      cp -f "$src64" "$dst64_sc" && echo "=== installed system32 steamclient64 trigger ===" >> "$log" 2>&1 || true
+    fi
   fi
 }
 
@@ -379,15 +437,16 @@ install_legacycompat() {
 }
 
 bridge_files="steamclient64.dll steamclient.dll tier0_s64.dll vstdlib_s64.dll"
-bridge_files="$bridge_files lsteamclient.dll lsteamclient.so steam.exe"
+bridge_files="$bridge_files tier0_s.dll vstdlib_s.dll"
+bridge_files="$bridge_files lsteamclient.dll lsteamclient.so steam.exe steamclient.so steamclient64.so ntdll_compat.so"
 if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
   stage_step="bridge staging"
   mkdir -p "$prefix_steam"
   for f in $bridge_files; do
     src="$bridge_src/$f"
-    if [ "$f" = lsteamclient.so ]; then
-      src="$bridge_src/${wine_unix##*/}/$f"
-    fi
+    case "$f" in
+      *.so) src="$bridge_src/${wine_unix##*/}/$f" ;;
+    esac
     if [ ! -f "$src" ]; then
       echo "=== bridge missing $f ===" >> "$log" 2>&1 || true
       continue
@@ -406,13 +465,36 @@ if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
   install_lsteamclient_trigger
   install_legacy_steam_dll
   export WINEDLLPATH="$prefix_steam:$WINEDLLPATH"
-  export WINEDLLOVERRIDES="steamclient=n;steamclient64=n;lsteamclient=b"
+  export WINEDLLOVERRIDES="steamclient=n,b;steamclient64=n,b;lsteamclient=b;d3dcompiler_43=n,b;d3dx9_43=n,b;d3dcompiler_47=n,b;nvapi64,nvngx=n,b;${WINEDLLOVERRIDES}"
   native_client="$STEAM_COMPAT_CLIENT_INSTALL_PATH"
   if [ -z "$native_client" ]; then
     native_client="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
     export STEAM_COMPAT_CLIENT_INSTALL_PATH="$native_client"
   fi
   install_legacycompat
+  install_directx_redist() {
+    redist_dir="$STEAM_COMPAT_INSTALL_PATH/DirectX_Redist"
+    [ -d "$redist_dir" ] || redist_dir="$STEAM_COMPAT_INSTALL_PATH/_CommonRedist/DirectX/Jun2010"
+    [ -d "$redist_dir" ] || return 0
+    command -v cabextract >/dev/null 2>&1 || return 0
+    wow64_dir="$WINEPREFIX/drive_c/windows/syswow64"
+    [ -d "$wow64_dir" ] || return 0
+    if [ ! -f "$wow64_dir/d3dcompiler_43.dll" ]; then
+      cab=$(find "$redist_dir" -iname "*D3DCompiler_43_x86.cab" 2>/dev/null | head -1)
+      if [ -n "$cab" ]; then
+        cabextract -q -d "$wow64_dir" -F "D3DCompiler_43.dll" "$cab" 2>/dev/null && \
+          echo "=== extracted D3DCompiler_43.dll from $cab ===" >> "$log" 2>&1 || true
+      fi
+    fi
+    if [ ! -f "$wow64_dir/d3dx9_43.dll" ]; then
+      cab=$(find "$redist_dir" -iname "*d3dx9_43_x86.cab" 2>/dev/null | head -1)
+      if [ -n "$cab" ]; then
+        cabextract -q -d "$wow64_dir" -F "d3dx9_43.dll" "$cab" 2>/dev/null && \
+          echo "=== extracted d3dx9_43.dll from $cab ===" >> "$log" 2>&1 || true
+      fi
+    fi
+  }
+  install_directx_redist
   echo "=== bridge staged into $prefix_steam ===" >> "$log" 2>&1 || true
   echo "WINEDLLPATH=$WINEDLLPATH" >> "$log" 2>&1 || true
   echo "STEAM_COMPAT_CLIENT_INSTALL_PATH=$STEAM_COMPAT_CLIENT_INSTALL_PATH" >> "$log" 2>&1 || true
@@ -431,6 +513,12 @@ esac
 
 if [ "$foreground" = 0 ]; then
   echo "=== running helper on raw loader: $* ===" >> "$log" 2>&1 || true
+  case "$target" in
+    *iscriptevaluator.exe*)
+      echo "=== iscriptevaluator bypassed for macOS compatibility ===" >> "$log" 2>&1 || true
+      exit 0
+      ;;
+  esac
   "$WINELOADER" "$@" >> "$log" 2>&1
   status=$?
   echo "=== helper exited status=$status ===" >> "$log" 2>&1 || true
@@ -584,7 +672,15 @@ for f in "$wine_unix"/*; do
   esac
   ln -sfn "$f" "$loader_macos/$base"
 done
+[ -d "$CX_ROOT/lib" ] && ln -sfn "$CX_ROOT/lib" "$loader_contents/lib"
 ln "$WINELOADER" "$loader_macos/wine" 2>/dev/null || cp "$WINELOADER" "$loader_macos/wine"
+loader_dir="$(dirname "$WINELOADER")"
+if [ -f "$loader_dir/wine64-preloader" ]; then
+  ln -sfn "$loader_dir/wine64-preloader" "$loader_macos/wine64-preloader" 2>/dev/null || true
+  ln -sfn "$loader_dir/wine64-preloader" "$loader_macos/wine-preloader" 2>/dev/null || true
+elif [ -f "$loader_dir/wine-preloader" ]; then
+  ln -sfn "$loader_dir/wine-preloader" "$loader_macos/wine-preloader" 2>/dev/null || true
+fi
 if [ -x "$loader_macos/wine" ]; then
   WINELOADER="$loader_macos/wine"
   echo "loader staged in bundle for game mode" >> "$log" 2>&1 || true
@@ -598,13 +694,15 @@ export WINELOADER="$WINELOADER"
 wine_log="$loader_root/notproton-wine.log"
 exec > "\$wine_log" 2>&1
 shim="$HOME/Library/Application Support/notproton/overlay-shim.dylib"
-if [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
-  if [ -f "\$shim" ]; then
+if [ -f "\$shim" ]; then
+  if [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
     export DYLD_INSERT_LIBRARIES="\$shim:\$STEAM_DYLD_INSERT_LIBRARIES"
-    export NOTPROTON_OVERLAY_SHIM="\$shim"
   else
-    export DYLD_INSERT_LIBRARIES="\$STEAM_DYLD_INSERT_LIBRARIES"
+    export DYLD_INSERT_LIBRARIES="\$shim"
   fi
+  export NOTPROTON_OVERLAY_SHIM="\$shim"
+elif [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
+  export DYLD_INSERT_LIBRARIES="\$STEAM_DYLD_INSERT_LIBRARIES"
 fi
 [ -n "\$NOTPROTON_GAME_CWD" ] && cd "\$NOTPROTON_GAME_CWD"
 "$WINELOADER" "\$@"
@@ -628,25 +726,53 @@ prefix_server_dir() {
 }
 
 prefix_game_running() {
-  command -v lsof >/dev/null 2>&1 || return 1
-  dir=$(prefix_server_dir) || return 1
-  [ -d "$dir" ] || return 1
-  pids=$(lsof -t +D "$dir" 2>/dev/null | sort -u | tr '\n' ',')
-  pids=${pids%,}
-  [ -n "$pids" ] || return 1
-  # shellcheck disable=SC1003 # the pair matches the backslash in a drive path
-  ps -p "$pids" -o args= 2>/dev/null | grep -E '^[A-Za-z]:\\' | grep -viE "$wine_helpers" | grep -q .
+  ps -ww -eo pid,args 2>/dev/null | \
+    grep -v "^[[:space:]]*$$[[:space:]]" | \
+    grep -iE '/(wine|wine64|wine-preloader|wine64-preloader)' | \
+    grep -iE '\.exe' | \
+    grep -viE "$wine_helpers" | \
+    grep -q .
+}
+
+activate_game() {
+  echo "=== activating game window ===" >> "$log" 2>&1 || true
+  game_pid=$(ps -ww -eo pid,args 2>/dev/null | grep -iE '/(wine|wine64|wine-preloader|wine64-preloader)' | grep -iE '\.exe' | grep -viE "$wine_helpers" | awk '{print $1}' | head -1)
+  if [ -n "$game_pid" ]; then
+    swift - "$game_pid" << 'EOF' >> "$log" 2>&1 || osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $game_pid) to true" >> "$log" 2>&1 || true
+import AppKit
+if let pidStr = CommandLine.arguments.dropFirst().first, let pid = pid_t(pidStr) {
+  _ = NSRunningApplication(processIdentifier: pid)?.activate()
+}
+EOF
+  fi
 }
 
 wait_prefix_idle() {
   idle=0
-  tick=0
-  while [ "$idle" -lt 10 ] && [ "$tick" -lt 300 ]; do
-    tick=$((tick + 1))
-    if prefix_game_running; then idle=0; else idle=$((idle + 1)); fi
+  activated=0
+  # Wait up to 20 seconds for the game process to appear
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    prefix_game_running && break
     sleep 1
   done
-  echo "wait_prefix_idle done after tick=$tick idle=$idle" >> "$log" 2>&1 || true
+  # Wait as long as the game is actively running
+  while :; do
+    if prefix_game_running; then
+      idle=0
+      if [ "$activated" -eq 0 ]; then
+        activate_game
+        activated=1
+      fi
+    else
+      idle=$((idle + 1))
+      activated=0
+      if [ "$idle" -ge 6 ]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+  echo "wait_prefix_idle done, game session concluded" >> "$log" 2>&1 || true
 }
 
 kill_wine_prefix() {
@@ -671,17 +797,21 @@ terminate() {
   echo "=== termination signal received, killing wine prefix ===" >> "$log" 2>&1 || true
   kill_wine_prefix
   [ -n "$open_pid" ] && kill "$open_pid" 2>/dev/null || true
+  exit 0
 }
 trap terminate TERM INT HUP
 
 shim_exe="C:\\Program Files (x86)\\Steam\\steam.exe"
 
 game_cwd="$(pwd)"
+game_name="$(basename "$1" 2>/dev/null || true)"
 if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
   echo "=== overlay injected from $STEAM_DYLD_INSERT_LIBRARIES ===" >> "$log" 2>&1 || true
 else
   echo "=== client staged no overlay renderer, overlay disabled ===" >> "$log" 2>&1 || true
 fi
+
+
 set -- --args "$shim_exe" "$@"
 for name in $(env | sed -nE 's/^(Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
   eval "value=\$$name"
@@ -714,6 +844,9 @@ seen=0
 idle=0
 while :; do
   if prefix_game_running; then
+    if [ "$seen" -eq 0 ]; then
+      activate_game
+    fi
     seen=1
     idle=0
   else
